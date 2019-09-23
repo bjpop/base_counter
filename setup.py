@@ -17,11 +17,12 @@ setup(
     packages=['base_counter'],
     package_dir={'base_counter': 'base_counter'},
     entry_points={
-        'console_scripts': ['base_counter = base_counter.base_counter:main']
+        'console_scripts': ['base_counter = base_counter.base_counter:main',
+        'variant_detection = base_counter.variant_detection:main']
     },
     url='https://github.com/bjpop/base_counter',
     license='LICENSE',
     description=('Count bases in a defined genomic region'),
     long_description=(LONG_DESCRIPTION),
-    install_requires=["pysam", "numpy"],
+    install_requires=["pysam", "numpy", "scipy"],
 )

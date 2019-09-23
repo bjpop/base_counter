@@ -50,11 +50,11 @@ def parse_args():
     '''
     description = 'Count frequency of DNA bases at genomic positions'
     parser = ArgumentParser(description=description)
+    parser.add_argument('--basequal', type=int, required=False,
+        default=0, help='Minimum base quality. Bases below the minimum quality will be silently ignored')
     parser.add_argument('--regions', type=str, required=True,
         help='Bed file coordinates of genomic regions to consider')
-    parser.add_argument('--countsout', type=str, required=True,
-        help='Output file for base counts per position')
-    parser.add_argument('--coverageout', type=str, required=True,
+    parser.add_argument('--coverageout', type=str, required=False,
         help='Output file for coverage per position')
     parser.add_argument('--version',
                         action='version',
@@ -100,11 +100,13 @@ class Counts(object):
         elif base == 'C':
             self.C += 1
         else:
-            logging.warning(f"Unrecognised base: {base}")
+            exit(f"Unrecognised base: {base}")
 
     def __str__(self):
-        return f"A: {self.A}, T:{self.T}, G:{self.G}, C:{self.C}"
+        return f"A:{self.A}, T:{self.T}, G:{self.G}, C:{self.C}"
 
+
+VALID_DNA_BASES = "ATGC"
 
 def process_bam_files(options, regions):
     # pos -> (base -> Int)
@@ -120,20 +122,20 @@ def process_bam_files(options, regions):
         samfile = pysam.AlignmentFile(bam_filename, "rb" )
         for coord in regions:
             chrom, start, end = coord
-            for pileupcolumn in samfile.pileup(chrom, start, end):
-                #print(f"coverage at base {pileupcolumn.pos} = {pileupcolumn.n}")
+            # ignore_orphans (bool) – ignore orphans (paired reads that are not in a proper pair). 
+            # ignore_overlaps (bool) – If set to True, detect if read pairs overlap and only take the higher quality base. 
+            for pileupcolumn in samfile.pileup(chrom, start, end, truncate=True, stepper='samtools',
+                ignore_overlaps=False, ignore_orphans=True, max_depth=1000000000, min_base_quality=options.basequal):
                 for pileupread in pileupcolumn.pileups:
-                    this_pos = pileupcolumn.pos
-                    if start <= this_pos <= end:
-                        if this_pos not in counts:
-                            counts[this_pos] = Counts()
-                        sample_coverage[this_pos] = pileupcolumn.n 
-                        if not pileupread.is_del and not pileupread.is_refskip:
-                            # query position is None if is_del or is_refskip is set.
-                            query_name = pileupread.alignment.query_name
-                            this_base = pileupread.alignment.query_sequence[pileupread.query_position]
-                            counts[this_pos].increment_base_count(this_base)
-                            #print(f'\tbase in read {query_name} = {this_base}') 
+                    this_pos_zero_based = pileupcolumn.pos
+                    this_pos_one_based = this_pos_zero_based + 1
+                    if this_pos_one_based not in counts:
+                        counts[this_pos_one_based] = Counts()
+                    sample_coverage[this_pos_one_based] = pileupcolumn.n 
+                    if not pileupread.is_del and not pileupread.is_refskip:
+                        this_base = pileupread.alignment.query_sequence[pileupread.query_position]
+                        if this_base in VALID_DNA_BASES:
+                            counts[this_pos_one_based].increment_base_count(this_base)
         samfile.close()
     return counts, coverage
 
@@ -161,11 +163,10 @@ def init_logging(log_filename):
 
 
 def output_counts(options, counts):
-    with open(options.countsout, "w") as file:
-        header = "pos\tA\tT\tG\tC"
-        print(header, file=file)
-        for pos in sorted(counts):
-            print(f"{pos}\t{counts[pos].A}\t{counts[pos].T}\t{counts[pos].G}\t{counts[pos].C}", file=file)
+    header = "pos\tA\tT\tG\tC"
+    print(header)
+    for pos in sorted(counts):
+        print(f"{pos}\t{counts[pos].A}\t{counts[pos].T}\t{counts[pos].G}\t{counts[pos].C}")
 
 
 def output_coverage(options, coverage):
@@ -203,7 +204,8 @@ def main():
     regions = get_regions(options) 
     counts, coverage = process_bam_files(options, regions)
     output_counts(options, counts)
-    output_coverage(options, coverage)
+    if options.coverageout is not None:
+        output_coverage(options, coverage)
 
 
 # If this script is run from the command line then call the main function.
