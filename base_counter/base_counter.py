@@ -52,10 +52,16 @@ def parse_args():
     parser = ArgumentParser(description=description)
     parser.add_argument('--basequal', type=int, required=False,
         default=0, help='Minimum base quality. Bases below the minimum quality will be silently ignored')
+    parser.add_argument('--mapqual', type=int, required=False,
+        default=0, help='Minimum mapping quality. Reads below the minimum quality will be silently ignored')
+    parser.add_argument('--alignlen', type=int, required=False,
+        default=0, help='Minimum alignment length of reads. Reads with fewer bases aligned to the reference will be silently ignored')
     parser.add_argument('--regions', type=str, required=True,
         help='Bed file coordinates of genomic regions to consider')
     parser.add_argument('--coverageout', type=str, required=False,
         help='Output file for coverage per position')
+    parser.add_argument('--overlap', required=False, action='store_true', default=False,
+        help='Only consider bases which are covered by forward and reverse reads and where both reads agree')
     parser.add_argument('--version',
                         action='version',
                         version='%(prog)s ' + PROGRAM_VERSION)
@@ -113,6 +119,11 @@ def process_bam_files(options, regions):
     counts = {}
     # sample -> (pos -> int)
     coverage = {}
+    num_queries_common = 0
+    num_queries_read1_only = 0
+    num_queries_read2_only = 0
+    num_matching_bases = 0
+    num_mismatching_bases = 0
     for bam_filename in options.bam_files:
         sample = pathlib.PurePath(bam_filename).stem
         if sample not in coverage:
@@ -125,18 +136,61 @@ def process_bam_files(options, regions):
             # ignore_orphans (bool) – ignore orphans (paired reads that are not in a proper pair). 
             # ignore_overlaps (bool) – If set to True, detect if read pairs overlap and only take the higher quality base. 
             for pileupcolumn in samfile.pileup(chrom, start, end, truncate=True, stepper='samtools',
-                ignore_overlaps=False, ignore_orphans=True, max_depth=1000000000, min_base_quality=options.basequal):
+                                               ignore_overlaps=False, ignore_orphans=True,
+                                               max_depth=1000000000, min_base_quality=options.basequal):
+                read1s = {}
+                read2s = {}
+                this_pos_zero_based = pileupcolumn.pos
+                this_pos_one_based = this_pos_zero_based + 1
+                if this_pos_one_based not in counts:
+                    counts[this_pos_one_based] = Counts()
+                sample_coverage[this_pos_one_based] = pileupcolumn.n 
+                # collect all bases in the current column, and assign them to either read1s or read2s
                 for pileupread in pileupcolumn.pileups:
-                    this_pos_zero_based = pileupcolumn.pos
-                    this_pos_one_based = this_pos_zero_based + 1
-                    if this_pos_one_based not in counts:
-                        counts[this_pos_one_based] = Counts()
-                    sample_coverage[this_pos_one_based] = pileupcolumn.n 
-                    if not pileupread.is_del and not pileupread.is_refskip:
-                        this_base = pileupread.alignment.query_sequence[pileupread.query_position]
-                        if this_base in VALID_DNA_BASES:
-                            counts[this_pos_one_based].increment_base_count(this_base)
+                    this_alignment = pileupread.alignment
+                    query_name = this_alignment.query_name
+                    mapping_quality = this_alignment.mapping_quality
+                    alignment_length = this_alignment.query_alignment_length
+                    # is_read1 and is_read2 are mutually exclusive
+                    is_read1 = this_alignment.is_read1
+                    is_read2 = this_alignment.is_read2
+                    if mapping_quality >= options.mapqual and alignment_length >= options.alignlen:
+                        if not pileupread.is_del and not pileupread.is_refskip:
+                            this_base = pileupread.alignment.query_sequence[pileupread.query_position]
+                            if this_base in VALID_DNA_BASES:
+                                if options.overlap:
+                                    if is_read1:
+                                        read1s[query_name] = this_base
+                                    elif is_read2:
+                                        read2s[query_name] = this_base
+                                else:
+                                    counts[this_pos_one_based].increment_base_count(this_base)
+                if options.overlap:
+                    read1_queries = set(read1s.keys())
+                    read2_queries = set(read2s.keys())
+                    queries_common = read1_queries.intersection(read2_queries)
+                    num_queries_common += len(queries_common)
+                    queries_read1_only = read1_queries - read2_queries
+                    num_queries_read1_only += len(queries_read1_only) 
+                    queries_read2_only = read2_queries - read1_queries
+                    num_queries_read2_only += len(queries_read2_only) 
+                    for this_query in queries_common:
+                        read1_base = read1s[this_query]
+                        read2_base = read2s[this_query]
+                        if read1_base == read2_base:
+                            # Increment the base twice because it appears on two reads
+                            counts[this_pos_one_based].increment_base_count(read1_base)
+                            counts[this_pos_one_based].increment_base_count(read1_base)
+                            num_matching_bases += 1
+                        else:
+                            num_mismatching_bases += 1
         samfile.close()
+    if options.overlap:
+        logging.info(f"Number of bases covered by two reads: {num_queries_common}")
+        logging.info(f"Number of bases covered by read 1 only: {num_queries_read1_only}")
+        logging.info(f"Number of bases covered by read 2 only: {num_queries_read2_only}")
+        logging.info(f"Number of bases covered by two reads that agree: {num_matching_bases}")
+        logging.info(f"Number of bases covered by two reads that disagree: {num_mismatching_bases}")
     return counts, coverage
 
 
