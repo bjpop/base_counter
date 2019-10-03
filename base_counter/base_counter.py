@@ -16,6 +16,7 @@ import pkg_resources
 import pysam
 import numpy as np
 import pathlib
+import csv
 
 
 EXIT_FILE_IO_ERROR = 1
@@ -58,8 +59,6 @@ def parse_args():
         default=0, help='Minimum alignment length of reads. Reads with fewer bases aligned to the reference will be silently ignored')
     parser.add_argument('--regions', type=str, required=True,
         help='Bed file coordinates of genomic regions to consider')
-    parser.add_argument('--coverageout', type=str, required=False,
-        help='Output file for coverage per position')
     parser.add_argument('--overlap', required=False, action='store_true', default=False,
         help='Only consider bases which are covered by forward and reverse reads and where both reads agree')
     parser.add_argument('--version',
@@ -69,11 +68,10 @@ def parse_args():
                         metavar='LOG_FILE',
                         type=str,
                         help='record program progress in LOG_FILE')
-    parser.add_argument('bam_files',
-                        nargs='*',
+    parser.add_argument('bam_file',
                         metavar='BAM_FILE',
                         type=str,
-                        help='Input BAM files')
+                        help='Input BAM file')
     return parser.parse_args()
 
 
@@ -114,84 +112,139 @@ class Counts(object):
 
 VALID_DNA_BASES = "ATGC"
 
-def process_bam_files(options, regions):
-    # pos -> (base -> Int)
-    counts = {}
-    # sample -> (pos -> int)
-    coverage = {}
+def process_bam_file(options, regions):
     num_queries_common = 0
     num_queries_read1_only = 0
     num_queries_read2_only = 0
     num_matching_bases = 0
     num_mismatching_bases = 0
-    for bam_filename in options.bam_files:
-        sample = pathlib.PurePath(bam_filename).stem
-        if sample not in coverage:
-            coverage[sample] = {}
-        sample_coverage = coverage[sample]
-        logging.info("Processing BAM file from %s", bam_filename)
-        samfile = pysam.AlignmentFile(bam_filename, "rb" )
-        for coord in regions:
-            chrom, start, end = coord
-            # ignore_orphans (bool) – ignore orphans (paired reads that are not in a proper pair). 
-            # ignore_overlaps (bool) – If set to True, detect if read pairs overlap and only take the higher quality base. 
-            for pileupcolumn in samfile.pileup(chrom, start, end, truncate=True, stepper='samtools',
-                                               ignore_overlaps=False, ignore_orphans=True,
-                                               max_depth=1000000000, min_base_quality=options.basequal):
-                read1s = {}
-                read2s = {}
-                this_pos_zero_based = pileupcolumn.pos
-                this_pos_one_based = this_pos_zero_based + 1
-                if this_pos_one_based not in counts:
-                    counts[this_pos_one_based] = Counts()
-                sample_coverage[this_pos_one_based] = pileupcolumn.n 
-                # collect all bases in the current column, and assign them to either read1s or read2s
-                for pileupread in pileupcolumn.pileups:
-                    this_alignment = pileupread.alignment
-                    query_name = this_alignment.query_name
-                    mapping_quality = this_alignment.mapping_quality
-                    alignment_length = this_alignment.query_alignment_length
-                    # is_read1 and is_read2 are mutually exclusive
-                    is_read1 = this_alignment.is_read1
-                    is_read2 = this_alignment.is_read2
-                    if mapping_quality >= options.mapqual and alignment_length >= options.alignlen:
-                        if not pileupread.is_del and not pileupread.is_refskip:
-                            this_base = pileupread.alignment.query_sequence[pileupread.query_position]
-                            if this_base in VALID_DNA_BASES:
-                                if options.overlap:
-                                    if is_read1:
-                                        read1s[query_name] = this_base
-                                    elif is_read2:
-                                        read2s[query_name] = this_base
-                                else:
-                                    counts[this_pos_one_based].increment_base_count(this_base)
-                if options.overlap:
-                    read1_queries = set(read1s.keys())
-                    read2_queries = set(read2s.keys())
-                    queries_common = read1_queries.intersection(read2_queries)
-                    num_queries_common += len(queries_common)
-                    queries_read1_only = read1_queries - read2_queries
-                    num_queries_read1_only += len(queries_read1_only) 
-                    queries_read2_only = read2_queries - read1_queries
-                    num_queries_read2_only += len(queries_read2_only) 
-                    for this_query in queries_common:
-                        read1_base = read1s[this_query]
-                        read2_base = read2s[this_query]
-                        if read1_base == read2_base:
-                            # Increment the base twice because it appears on two reads
-                            counts[this_pos_one_based].increment_base_count(read1_base)
-                            counts[this_pos_one_based].increment_base_count(read1_base)
-                            num_matching_bases += 1
+    total_reads = 0 
+    total_failed_mapping_quality = 0 
+    total_failed_base_quality = 0
+    total_failed_align_length = 0 
+    total_failed_overlapping_positions = 0
+    total_failed_valid_dna_base = 0
+    bam_filename = options.bam_file
+    sample = pathlib.PurePath(bam_filename).stem
+    logging.info(f"Processing BAM file from {bam_filename} for sample {sample}")
+    samfile = pysam.AlignmentFile(bam_filename, "rb" )
+    fieldnames = ['chrom', 'pos', 'sample', 'A', 'T', 'G', 'C', 'unfiltered coverage', 'filtered coverage', 'failed mapping quality', 'failed align length', 'failed base quality', 'failed valid DNA base', 'base absent', 'base not overlapped', 'failed overlapping positions']
+    writer = csv.DictWriter(sys.stdout, delimiter=',', fieldnames=fieldnames) 
+    writer.writeheader()
+    for coord in regions:
+        chrom, start, end = coord
+        # ignore_orphans (bool) – ignore orphans (paired reads that are not in a proper pair). 
+        # ignore_overlaps (bool) – If set to True, detect if read pairs overlap and only take the higher quality base. 
+        for pileupcolumn in samfile.pileup(chrom, start, end, truncate=True, stepper='samtools',
+                                           ignore_overlaps=False, ignore_orphans=True,
+                                           max_depth=1000000000):
+            pos_failed_mapping_quality_reads = set()
+            pos_failed_align_length_reads = set()
+            pos_failed_base_quality = 0
+            pos_failed_overlapping_positions = 0
+            pos_failed_valid_dna_base = 0
+            pos_del_skip = 0
+            num_pos_reads = 0 
+            read1s = {}
+            read2s = {}
+            this_pos_zero_based = pileupcolumn.pos
+            this_pos_one_based = this_pos_zero_based + 1
+            counts = Counts()
+            # the maximum number of reads aligning to this position before filtering
+            unfiltered_coverage = pileupcolumn.n 
+            # collect all bases in the current column, and assign them to either read1s or read2s
+            for pileupread in pileupcolumn.pileups:
+                num_pos_reads += 1
+                count_this_read = True
+                this_alignment = pileupread.alignment
+                query_name = this_alignment.query_name
+                mapping_quality = this_alignment.mapping_quality
+                alignment_length = this_alignment.query_alignment_length
+                # is_read1 and is_read2 are mutually exclusive
+                is_read1 = this_alignment.is_read1
+                is_read2 = this_alignment.is_read2
+                unique_query_name = query_name
+                if is_read1:
+                    unique_query_name += "_R1"
+                if is_read2:
+                    unique_query_name += "_R2"
+                # Skip reads that fail mapping quality
+                if mapping_quality < options.mapqual:
+                    pos_failed_mapping_quality_reads.add(unique_query_name)
+                    count_this_read = False 
+                # Skip reads that fail alignment length 
+                if alignment_length < options.alignlen:
+                    pos_failed_align_length_reads.add(unique_query_name)
+                    count_this_read = False 
+                if not pileupread.is_del and not pileupread.is_refskip:
+                    this_base = pileupread.alignment.query_sequence[pileupread.query_position].upper()
+                    this_base_qual = pileupread.alignment.query_qualities[pileupread.query_position]
+                    if this_base_qual < options.basequal:
+                        pos_failed_base_quality += 1
+                        count_this_read = False 
+                    if this_base not in VALID_DNA_BASES:
+                        pos_failed_valid_dna_base += 1
+                        count_this_read = False
+                    if count_this_read:
+                        if options.overlap:
+                            if is_read1:
+                               read1s[query_name] = this_base
+                            elif is_read2:
+                               read2s[query_name] = this_base
                         else:
-                            num_mismatching_bases += 1
-        samfile.close()
+                            counts.increment_base_count(this_base)
+                else:
+                    pos_del_skip += 1
+            if options.overlap:
+                read1_queries = set(read1s.keys())
+                read2_queries = set(read2s.keys())
+                queries_common = read1_queries.intersection(read2_queries)
+                num_queries_common += len(queries_common)
+                queries_read1_only = read1_queries - read2_queries
+                num_queries_read1_only += len(queries_read1_only) 
+                queries_read2_only = read2_queries - read1_queries
+                num_queries_read2_only += len(queries_read2_only) 
+                for this_query in queries_common:
+                    read1_base = read1s[this_query]
+                    read2_base = read2s[this_query]
+                    if read1_base == read2_base:
+                        # Increment the base twice because it appears on two reads
+                        counts.increment_base_count(read1_base)
+                        counts.increment_base_count(read1_base)
+                    else:
+                        pos_failed_overlapping_positions += 1
+            num_pos_failed_mapping_quality = len(pos_failed_mapping_quality_reads)
+            num_pos_failed_align_length = len(pos_failed_align_length_reads) 
+            num_pos_not_overlapped = num_queries_read1_only + num_queries_read2_only
+            output_row = {'chrom': 17,
+                          'pos': this_pos_one_based,
+                          'sample': sample,
+                          'A': counts.A, 'T': counts.T, 'G': counts.G, 'C': counts.C,
+                          'unfiltered coverage': num_pos_reads,
+                          'filtered coverage': counts.A + counts.T + counts.G + counts.C,
+                          'failed mapping quality': num_pos_failed_mapping_quality,
+                          'failed align length': num_pos_failed_align_length,
+                          'failed base quality': pos_failed_base_quality,
+                          'failed valid DNA base': pos_failed_valid_dna_base,
+                          'base absent': pos_del_skip,
+                          'base not overlapped': num_pos_not_overlapped,
+                          'failed overlapping positions': pos_failed_overlapping_positions}
+            writer.writerow(output_row) 
+            total_failed_mapping_quality += num_pos_failed_mapping_quality
+            total_failed_align_length += num_pos_failed_align_length
+            total_failed_base_quality += pos_failed_base_quality
+            total_failed_overlapping_positions += pos_failed_overlapping_positions
+            total_failed_valid_dna_base += pos_failed_valid_dna_base
+            total_failed_overlapping_positions += num_queries_read1_only + num_queries_read2_only
+            total_reads += num_pos_reads
+    samfile.close()
+    logging.info(f"Total number of reads considered: {total_reads}")
+    logging.info(f"Number of reads that failed mapping quality threshold: {total_failed_mapping_quality}")
+    logging.info(f"Number of reads that failed the alignment length threshold: {total_failed_align_length}")
+    logging.info(f"Number of bases that failed base quality threshold: {total_failed_base_quality}")
+    logging.info(f"Number of bases that failed valid DNA base: {total_failed_valid_dna_base}")
     if options.overlap:
-        logging.info(f"Number of bases covered by two reads: {num_queries_common}")
-        logging.info(f"Number of bases covered by read 1 only: {num_queries_read1_only}")
-        logging.info(f"Number of bases covered by read 2 only: {num_queries_read2_only}")
-        logging.info(f"Number of bases covered by two reads that agree: {num_matching_bases}")
-        logging.info(f"Number of bases covered by two reads that disagree: {num_mismatching_bases}")
-    return counts, coverage
+        logging.info(f"Number of bases that failed the overlapping reads requirement: {total_failed_overlapping_positions}")
 
 
 def init_logging(log_filename):
@@ -256,10 +309,7 @@ def main():
     options = parse_args()
     init_logging(options.log)
     regions = get_regions(options) 
-    counts, coverage = process_bam_files(options, regions)
-    output_counts(options, counts)
-    if options.coverageout is not None:
-        output_coverage(options, coverage)
+    process_bam_file(options, regions)
 
 
 # If this script is run from the command line then call the main function.
