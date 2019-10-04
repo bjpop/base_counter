@@ -24,5 +24,5 @@ setup(
     license='LICENSE',
     description=('Count bases in a defined genomic region'),
     long_description=(LONG_DESCRIPTION),
-    install_requires=["pysam", "numpy", "scipy"],
+    install_requires=["pysam", "numpy", "scipy", "intervaltree"],
 )
