@@ -18,7 +18,8 @@ setup(
     package_dir={'base_counter': 'base_counter'},
     entry_points={
         'console_scripts': ['base_counter = base_counter.base_counter:main',
-        'variant_detection = base_counter.variant_detection:main']
+        'variant_detection = base_counter.variant_detection:main',
+        'reference_bases = base_counter.reference_bases:main']
     },
     url='https://github.com/bjpop/base_counter',
     license='LICENSE',

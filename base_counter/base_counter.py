@@ -233,7 +233,7 @@ def process_bam_files(options, regions, amplicons):
                 this_pos_one_based = this_pos_zero_based + 1
                 counts = Counts()
                 # the maximum number of reads aligning to this position before filtering
-                unfiltered_coverage = pileupcolumn.n 
+                unfiltered_coverage = pileupcolumn.nsegments
                 # collect all bases in the current column, and assign them to either read1s or read2s
                 for pileupread in pileupcolumn.pileups:
                     num_pos_reads += 1
@@ -305,7 +305,8 @@ def process_bam_files(options, regions, amplicons):
                               'pos': this_pos_one_based,
                               'sample': sample,
                               'A': counts.A, 'T': counts.T, 'G': counts.G, 'C': counts.C,
-                              'unfiltered coverage': num_pos_reads,
+                              #'unfiltered coverage': num_pos_reads,
+                              'unfiltered coverage': unfiltered_coverage,
                               'filtered coverage': counts.A + counts.T + counts.G + counts.C,
                               'failed amplicon location': pos_failed_amplicon,
                               'failed mapping quality': num_pos_failed_mapping_quality,
