@@ -61,6 +61,8 @@ def parse_args():
         default=0, help='Minimum alignment length of reads. Reads with fewer bases aligned to the reference will be silently ignored')
     parser.add_argument('--ampliconprop', type=float, required=True,
         help='Minimum proportion of amplicon overlapped by a read')
+    parser.add_argument('--maxnm', type=int, required=True,
+        help='Maximum number of mismatches (NM) per read')
     parser.add_argument('--regions', type=str, required=True,
         help='Bed file coordinates of genomic regions to consider')
     parser.add_argument('--amplicons', type=str, required=True,
@@ -196,13 +198,14 @@ VALID_DNA_BASES = "ATGC"
 
 def process_bam_files(options, regions, amplicons):
     total_reads = 0 
+    total_failed_nm = 0
     total_failed_mapping_quality = 0 
     total_failed_base_quality = 0
     total_failed_align_length = 0 
     total_failed_overlapping_positions = 0
     total_failed_valid_dna_base = 0
     total_failed_amplicon = 0
-    fieldnames = ['chrom', 'pos', 'sample', 'A', 'T', 'G', 'C', 'unfiltered coverage', 'filtered coverage', 'failed amplicon location', 'failed mapping quality', 'failed align length', 'failed base quality', 'failed valid DNA base', 'base absent', 'base not overlapped', 'failed overlapping positions']
+    fieldnames = ['chrom', 'pos', 'sample', 'A', 'T', 'G', 'C', 'unfiltered coverage', 'filtered coverage', 'failed nm count', 'failed amplicon location', 'failed mapping quality', 'failed align length', 'failed base quality', 'failed valid DNA base', 'base absent', 'base not overlapped', 'failed overlapping positions']
     writer = csv.DictWriter(sys.stdout, delimiter=',', fieldnames=fieldnames) 
     writer.writeheader()
     for bam_filename in options.bam_files:
@@ -221,6 +224,7 @@ def process_bam_files(options, regions, amplicons):
                                                max_depth=1000000000):
                 pos_failed_mapping_quality_reads = set()
                 pos_failed_align_length_reads = set()
+                pos_failed_nm = 0
                 pos_failed_base_quality = 0
                 pos_failed_overlapping_positions = 0
                 pos_failed_valid_dna_base = 0
@@ -245,6 +249,13 @@ def process_bam_files(options, regions, amplicons):
                     query_name = this_alignment.query_name
                     mapping_quality = this_alignment.mapping_quality
                     alignment_length = this_alignment.query_alignment_length
+                    nm_count = 0
+                    cigar_stats = this_alignment.get_cigar_stats()[0]
+                    if len(cigar_stats) == 11:
+                        nm_count = cigar_stats[10]
+                    if nm_count > options.maxnm:
+                        pos_failed_nm += 1
+                        count_this_read = False
                     # is_read1 and is_read2 are mutually exclusive
                     is_read1 = this_alignment.is_read1
                     is_read2 = this_alignment.is_read2
@@ -313,10 +324,12 @@ def process_bam_files(options, regions, amplicons):
                               'failed align length': num_pos_failed_align_length,
                               'failed base quality': pos_failed_base_quality,
                               'failed valid DNA base': pos_failed_valid_dna_base,
+                              'failed nm count': pos_failed_nm,
                               'base absent': pos_del_skip,
                               'base not overlapped': num_pos_not_overlapped,
                               'failed overlapping positions': pos_failed_overlapping_positions}
                 writer.writerow(output_row) 
+                total_failed_nm += pos_failed_nm
                 total_failed_mapping_quality += num_pos_failed_mapping_quality
                 total_failed_align_length += num_pos_failed_align_length
                 total_failed_base_quality += pos_failed_base_quality
@@ -330,6 +343,7 @@ def process_bam_files(options, regions, amplicons):
     logging.info(f"Number of reads that failed amplicon overlap: {total_failed_amplicon}")
     logging.info(f"Number of reads that failed mapping quality threshold: {total_failed_mapping_quality}")
     logging.info(f"Number of reads that failed the alignment length threshold: {total_failed_align_length}")
+    logging.info(f"Number of reads that failed the NM count: {total_failed_nm}")
     logging.info(f"Number of bases that failed base quality threshold: {total_failed_base_quality}")
     logging.info(f"Number of bases that failed valid DNA base: {total_failed_valid_dna_base}")
     if options.overlap:
